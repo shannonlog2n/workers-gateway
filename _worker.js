@@ -709,6 +709,15 @@ function setSecurityHeaders(headers = {}, includeTurnstile = false) {
   };
 }
 
+// 设置缓存响应头
+function setCacheHeaders(headers = {}, maxAge = 3600) {
+  return {
+    ...headers,
+    'Cache-Control': `public, max-age=${maxAge}`,
+    'ETag': Date.now().toString(36)
+  };
+}
+
 // 创建JSON响应
 function createJsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -780,6 +789,20 @@ class CryptoUtil {
   static async hmacVerify(message, signature, key) {
     const calculatedSignature = await this.hmacSign(message, key);
     return calculatedSignature === signature;
+  }
+  
+  /**
+   * 生成内容的哈希值作为ETag
+   * @param {string} content - 内容
+   * @returns {Promise<string>} - 哈希值
+   */
+  static async generateETag(content) {
+    const encoder = new TextEncoder();
+    const contentData = encoder.encode(content);
+    
+    const hashBuffer = await crypto.subtle.digest('SHA-1', contentData);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   }
 }
 
@@ -920,6 +943,7 @@ class RouteManager {
    */
   constructor(kv) {
     this.kv = kv;
+    this.cacheVersion = Date.now().toString(36); // 用于缓存版本控制
   }
   
   /**
@@ -942,6 +966,19 @@ class RouteManager {
    */
   async saveConfig(config) {
     await this.kv.put('config', JSON.stringify(config));
+    // 更新缓存版本
+    this.cacheVersion = Date.now().toString(36);
+    // 存储缓存版本号到KV
+    await this.kv.put('cache_version', this.cacheVersion);
+  }
+  
+  /**
+   * 获取缓存版本号
+   * @returns {Promise<string>} - 缓存版本号
+   */
+  async getCacheVersion() {
+    const version = await this.kv.get('cache_version');
+    return version || this.cacheVersion;
   }
   
   /**
@@ -967,6 +1004,9 @@ class RouteManager {
     
     // 存储内容
     await this.kv.put(route.content_key, route.content);
+    
+    // 生成内容哈希作为ETag
+    route.etag = await CryptoUtil.generateETag(route.content);
     
     // 从路由对象中删除内容
     delete route.content;
@@ -1020,22 +1060,38 @@ class RouteManager {
     
     // 处理内容类型
     if (route.type === 'content') {
-      // 使用现有内容键或创建新的
-      const contentKey = oldRoute.type === 'content' ? 
-        oldRoute.content_key : 
-        `content_${route.path.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}`;
+      // 检查内容是否已更改
+      let contentChanged = true;
       
-      // 存储内容
-      await this.kv.put(contentKey, route.content);
+      if (oldRoute.type === 'content' && oldRoute.content_key) {
+        const oldContent = await this.kv.get(oldRoute.content_key);
+        if (oldContent === route.content) {
+          contentChanged = false;
+          route.content_key = oldRoute.content_key;
+          route.etag = oldRoute.etag;
+        }
+      }
       
-      // 更新内容键
-      route.content_key = contentKey;
+      if (contentChanged) {
+        // 内容已更改或类型从redirect改为content
+        const contentKey = `content_${route.path.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}`;
+        
+        // 存储内容
+        await this.kv.put(contentKey, route.content);
+        
+        // 生成ETag
+        route.etag = await CryptoUtil.generateETag(route.content);
+        
+        // 更新内容键
+        route.content_key = contentKey;
+      }
       
       // 从路由对象中删除内容
       delete route.content;
     } else if (oldRoute.type === 'content' && route.type === 'redirect') {
       // 如果类型从content改为redirect，保留content_key以防需要切换回来
       route.content_key = oldRoute.content_key;
+      route.etag = oldRoute.etag;
     }
     
     // 更新配置
@@ -1143,13 +1199,21 @@ class AdminController {
     // 检查是否是资源请求
     if (this.path === '/admin/styles.css') {
       return new Response(TEMPLATES.adminStyles, {
-        headers: setSecurityHeaders({ 'Content-Type': 'text/css' })
+        headers: setSecurityHeaders({
+          'Content-Type': 'text/css',
+          // 管理界面资源可以缓存较长时间
+          'Cache-Control': 'public, max-age=86400'
+        })
       });
     }
     
     if (this.path === '/admin/scripts.js') {
       return new Response(TEMPLATES.adminScripts, {
-        headers: setSecurityHeaders({ 'Content-Type': 'application/javascript' })
+        headers: setSecurityHeaders({
+          'Content-Type': 'application/javascript',
+          // 管理界面资源可以缓存较长时间
+          'Cache-Control': 'public, max-age=86400'
+        })
       });
     }
     
@@ -1231,7 +1295,9 @@ class AdminController {
     
     const headers = setSecurityHeaders({
       'Content-Type': 'text/html',
-      'Set-Cookie': this.authManager.createCsrfCookie(csrfToken)
+      'Set-Cookie': this.authManager.createCsrfCookie(csrfToken),
+      // 管理面板不缓存
+      'Cache-Control': 'no-store, must-revalidate'
     });
     
     return new Response(TEMPLATES.admin(config.routes, csrfToken), { headers });
@@ -1257,7 +1323,8 @@ class AdminController {
         const csrfToken = this.generateCsrfToken();
         const headers = setSecurityHeaders({
           'Content-Type': 'text/html',
-          'Set-Cookie': this.authManager.createCsrfCookie(csrfToken)
+          'Set-Cookie': this.authManager.createCsrfCookie(csrfToken),
+          'Cache-Control': 'no-store, must-revalidate'
         }, true);
         
         return new Response(
@@ -1278,14 +1345,16 @@ class AdminController {
           status: 302,
           headers: setSecurityHeaders({
             'Location': '/admin',
-            'Set-Cookie': [authCookie, csrfCookie]
+            'Set-Cookie': [authCookie, csrfCookie],
+            'Cache-Control': 'no-store, must-revalidate'
           })
         });
       } else {
         const csrfToken = this.generateCsrfToken();
         const headers = setSecurityHeaders({
           'Content-Type': 'text/html',
-          'Set-Cookie': this.authManager.createCsrfCookie(csrfToken)
+          'Set-Cookie': this.authManager.createCsrfCookie(csrfToken),
+          'Cache-Control': 'no-store, must-revalidate'
         }, true);
         
         return new Response(
@@ -1299,7 +1368,8 @@ class AdminController {
     const csrfToken = this.generateCsrfToken();
     const headers = setSecurityHeaders({
       'Content-Type': 'text/html',
-      'Set-Cookie': this.authManager.createCsrfCookie(csrfToken)
+      'Set-Cookie': this.authManager.createCsrfCookie(csrfToken),
+      'Cache-Control': 'no-store, must-revalidate'
     }, true);
     
     return new Response(
@@ -1327,7 +1397,10 @@ class AdminController {
       return createJsonResponse(
         { success: true, message: '已成功退出登录' },
         200,
-        { 'Set-Cookie': logoutCookie }
+        { 
+          'Set-Cookie': logoutCookie,
+          'Cache-Control': 'no-store, must-revalidate'
+        }
       );
     } catch (error) {
       return createErrorResponse('退出失败: ' + error.message, 500);
@@ -1450,7 +1523,7 @@ class AdminController {
    * 处理切换路由启用状态
    * @returns {Promise<Response>} - 响应
    */
-  async handleToggleRoute() {
+   async handleToggleRoute() {
     if (this.request.method !== 'POST') {
       return createErrorResponse('Method Not Allowed', 405);
     }
@@ -1492,7 +1565,10 @@ class AdminController {
       
       const content = await this.routeManager.getContent(key);
       return new Response(content, {
-        headers: setSecurityHeaders({ 'Content-Type': 'text/plain' })
+        headers: setSecurityHeaders({ 
+          'Content-Type': 'text/plain',
+          'Cache-Control': 'no-store, must-revalidate' // 内容不缓存
+        })
       });
     } catch (error) {
       return createErrorResponse(error.message);
@@ -1536,10 +1612,32 @@ class GatewayApp {
       return adminController.handleRequest();
     }
     
+    // 检查缓存控制
+    const ifNoneMatch = this.request.headers.get('If-None-Match');
+    const cacheVersion = await this.routeManager.getCacheVersion();
+    
     // 处理根路径
     if (this.path === '/') {
+      // 生成ETag和缓存控制
+      const etag = `W/"index-${cacheVersion}"`;
+      
+      // 如果客户端提供了匹配的ETag，返回304未修改
+      if (ifNoneMatch && ifNoneMatch === etag) {
+        return new Response(null, {
+          status: 304,
+          headers: {
+            'ETag': etag,
+            'Cache-Control': 'public, max-age=3600'
+          }
+        });
+      }
+      
       return new Response(TEMPLATES.index, {
-        headers: setSecurityHeaders({ 'Content-Type': 'text/html' })
+        headers: setSecurityHeaders({ 
+          'Content-Type': 'text/html',
+          'ETag': etag,
+          'Cache-Control': 'public, max-age=3600'
+        })
       });
     }
     
@@ -1557,16 +1655,54 @@ class GatewayApp {
                            content.trim().startsWith('<html') ? 
                            'text/html' : 'text/plain; charset=utf-8';
         
+        // 使用保存的ETag或生成新的
+        const etag = route.etag || await CryptoUtil.generateETag(content);
+        
+        // 如果客户端提供了匹配的ETag，返回304未修改
+        if (ifNoneMatch && ifNoneMatch === etag) {
+          return new Response(null, {
+            status: 304,
+            headers: {
+              'ETag': etag,
+              'Cache-Control': 'public, max-age=3600',
+              'X-Cache-Version': cacheVersion
+            }
+          });
+        }
+        
         return new Response(content, {
-          headers: setSecurityHeaders({ 'Content-Type': contentType })
+          headers: setSecurityHeaders({ 
+            'Content-Type': contentType,
+            'ETag': etag,
+            'Cache-Control': 'public, max-age=3600',
+            'X-Cache-Version': cacheVersion
+          })
         });
       }
     }
     
     // 默认返回404
+    // 404页面也进行缓存控制
+    const notFoundEtag = `W/"404-${cacheVersion}"`;
+    
+    // 如果客户端提供了匹配的ETag，返回304未修改
+    if (ifNoneMatch && ifNoneMatch === notFoundEtag) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          'ETag': notFoundEtag,
+          'Cache-Control': 'public, max-age=60' // 404页面缓存时间较短
+        }
+      });
+    }
+    
     return new Response(TEMPLATES.notFound, {
       status: 404,
-      headers: setSecurityHeaders({ 'Content-Type': 'text/html' })
+      headers: setSecurityHeaders({ 
+        'Content-Type': 'text/html',
+        'ETag': notFoundEtag,
+        'Cache-Control': 'public, max-age=60' // 404页面缓存时间较短
+      })
     });
   }
 }
